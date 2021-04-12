@@ -1,0 +1,523 @@
+---
+title: "Portfolio Report"
+author: "Rudolf Engelke, github.com/rengelke, rudolf.engelke@web.de"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo    = FALSE,
+                      warning = FALSE,
+                      message = FALSE)
+
+```
+
+
+```{r, include = FALSE}
+
+source("utils.R")
+
+# load stock table and prices
+stock_table <- readRDS("./data/stock_table_filt_stats.rds")
+stock_prices <- readRDS("./data/stock_prices_filt.rds")
+
+stock_table %<>% dplyr::filter(!ISIN %in% isin_exclude)
+stock_prices %<>% .[!names(stock_prices) %in% isin_exclude]
+
+
+message_files <- list.files("messages/", full.names = TRUE, 
+                           pattern = paste(save_date))
+weights_files <- list.files("data/weights/", full.names = TRUE, recursive = TRUE,
+                           pattern = paste(save_date))
+
+portfolio_price <- readRDS("./data/stock_prices.rds")[["..."]]
+world_price <- tradr::get_prices("1342039", src = "onvista_bx") %>%
+    tradr::fix_OHLC()
+
+## current portfolio
+boxx_portfolio <- readRDS("./data/portfolio_curr.rds") %>% .[[1]] %>%
+    dplyr::rename(curr_share = `Gewichtung.in..`) %>%
+    dplyr::mutate(curr_share = as.numeric(curr_share)/100)
+
+# load strategies
+strategies <- read.csv("./tables/trading_strategies.csv",
+                       stringsAsFactors = FALSE) %>%
+    dplyr::rename(id = X) %>%
+    dplyr::filter(par1 >= 90, par1%%2 == 0) %>%
+    dplyr::filter(par2 <= 20)
+
+```
+
+&nbsp;
+
+&nbsp;
+
+
+## Portfolio
+
+```{r}
+
+portfolio_master_sl <- weights_files[grepl("master_sl.rds", weights_files)] %>% 
+    readRDS()
+
+cash_position <- portfolio_master_sl$CORR %>% last() %>% as.numeric()
+cash_total <- portfolio_price %>% last() %>% Cl() %>% `*`(1000)
+cash_total <- cash_total-(cash_total*ifelse(cash_position<0.05, 0, cash_position))
+
+
+# ----------------------------------------------------------
+
+# view weighted positions
+portfolio_master_shrt <- portfolio_master_sl %>% 
+    tail(5) %>% t() %>% 
+    as.data.frame() %>% 
+    tibble::rownames_to_column(var = "ISIN") %>%  
+    dplyr::left_join(stock_table %>% 
+                         dplyr::select(ISIN, Name), ., by = "ISIN") %>% 
+    dplyr::filter_at(vars(-ISIN, -Name), dplyr::any_vars(.!=0)) %>%
+    dplyr::arrange_at(ncol(.), dplyr::desc) 
+
+# current prices
+last_price <- stock_prices[portfolio_master_shrt$ISIN] %>% 
+    lapply(last) %>% lapply(Cl) %>%
+    dplyr::bind_rows(.id = "ISIN")
+
+
+# should position be rebalanced
+portf_rebalance <- portfolio_master_shrt %>% apply(1, function (x) {
+  x %>% .[3:7] %>% t() %>% as.numeric() %>% diff() %>% sum() %>% abs() %>% round(3)
+}) %>% as.data.frame() %>%
+  dplyr::mutate(ISIN = portfolio_master_shrt$ISIN) %>%
+  `colnames<-`(c("rebalance", "ISIN"))
+
+
+# portfolio summary
+position_summary <- last_price %>% 
+    dplyr::mutate(Share = portfolio_master_shrt[, paste(save_date)] %>% 
+                      as.numeric(),
+                  Value = (portfolio_price %>% last() %>% Cl() %>% `*`(1000)) %>%
+                      as.numeric()) %>%
+    dplyr::left_join(., boxx_portfolio, by = "ISIN") %>%
+    dplyr::left_join(., portf_rebalance, by = "ISIN") %>%
+    dplyr::mutate(N_now = (curr_share * Value / Close) %>% round(0)) %>%
+    dplyr::mutate(N_tmp = (Share * Value / Close) %>% round(0) %>%
+                      {ifelse(.==0, 1, .)},
+                  N_tmp2 = dplyr::if_else(Share < 0.015, 
+                                          round(N_tmp * 0.75, 0), N_tmp)) %>%
+    dplyr::mutate(Price_total = Close * N_tmp2) %>%
+    dplyr::mutate(Spent = cumsum(Price_total), 
+                  Cash_total = as.numeric(cash_total),
+                  Cash_diff = Cash_total - Spent) %>% 
+    dplyr::mutate(N = dplyr::if_else(rebalance >= 0.001, N_tmp2, N_now)) %>%
+    dplyr::mutate(N = dplyr::if_else(Cash_diff >= 0, N, 0))
+    
+
+portfolio_master_shrt %>% 
+    dplyr::left_join(., position_summary %>% 
+                         dplyr::select(ISIN, N_now, N),
+                     by = "ISIN") %T>%
+    saveRDS("./data/portfolio_summary.rds") %>%
+    dplyr::mutate_if(is.numeric, function (x) round(x, 3)) %>%
+    kableExtra::kbl() %>%
+    kableExtra::kable_styling(bootstrap_options = c("striped", "hover"))
+
+```
+&nbsp;
+
+Cash
+
+```{r}
+
+cash_position
+
+```
+
+&nbsp;
+
+### Weight Distribution Map
+
+&nbsp;
+
+```{r, fig.width=25, fig.height=15}
+
+rank_weights_list <- readRDS("data/weights/rank_weights_list.rds")
+
+rank_weights_last <- rank_weights_list %>%
+    lapply(last) %>%
+    do.call(rbind, .) %>%
+    t() %>% as.data.frame()
+
+idx <- rank_weights_last %>% rowSums() %>% {.>0}
+
+strategy_name <- strategies %>% 
+    dplyr::filter(id %in% names(rank_weights_list)) %>%
+    .[match(.$id, names(rank_weights_list)), ] %>% #??
+    dplyr::mutate(strategy_name = paste0(indicator, "/", filter, "/", par1, ":", par2))
+
+rank_weights_last_df <-
+    rank_weights_last %>% .[idx, ] %>%
+    `colnames<-`(strategy_name$strategy_name) %>% ##warning here!!!
+    tibble::rownames_to_column(var = "ISIN") %>%
+    dplyr::left_join(., stock_table %>% dplyr::select(ISIN, Name), by = "ISIN") %>%
+    dplyr::mutate(Name2 = paste0(ISIN, "  ", Name)) %>%
+    dplyr::select(-Name, -ISIN) %>%
+    tibble::column_to_rownames(var = "Name2")
+  
+idx_col_order <- rank_weights_last_df %>% t() %>% colSums() %>% order()
+idx_row_order <- rank_weights_last_df %>% t() %>% rowSums() %>% order()
+
+mat <- rank_weights_last_df %>% t() %>% 
+    .[idx_row_order, idx_col_order] %>% t() %>%
+    .[rev(1:nrow(.)), ] 
+
+pheatmap::pheatmap(mat, scale = "none", 
+                   cluster_rows = F, cluster_cols = TRUE,
+                   fontsize_row = 15, show_colnames = FALSE,
+                   color = colorRampPalette(RColorBrewer::brewer.pal(n = 5, name = "PuBuGn"))(100),
+                   clustering_method = "complete")
+
+```
+
+&nbsp;
+
+### Performance
+
+&nbsp;
+
+```{r}
+
+cbind.xts(
+    world_price$Close %>% .["2018-05-30::"] %>% dailyReturn() %>% cumsum(), 
+    portfolio_price$Close %>% .["2018-05-30::"] %>% dailyReturn() %>% cumsum()
+    ) %>%
+    na.approx() %>%
+    `colnames<-`(c("MSCI World", "BOXX")) %>%
+    dygraphs::dygraph(ylab = "price", group = "MSCI World") %>%
+    dygraphs::dyRangeSelector(dateWindow = c("2018-05-30", as.character(Sys.Date()))) %>%
+    dygraphs::dyOptions(colors = rev(RColorBrewer::brewer.pal(3, "Set1")[1:2]))
+
+```
+
+&nbsp;
+
+## Status
+
+&nbsp;
+
+```{r}
+
+last_date_expect <- date_seq[date_seq <= Sys.Date()] %>%
+    tail(1)
+
+# completed w/o error
+status_general <- grepl("exit_error.txt", message_files) %>% 
+    any() %>% `!` %>% as.character()
+
+# main data files up-to-date
+tryCatch(
+    { 
+        status_file_date <<- list.files("data/", pattern = "stock_", full.names = TRUE) %>%
+            lapply(function (x) {file.info(x)$mtime %>% 
+                    as.Date() %>% 
+                    all.equal(Sys.Date())}) %>%
+            unlist()  %>% all()
+    }, 
+    error = function (e) 
+        {
+        status_file_date <<- FALSE
+        }
+    )
+
+# check date
+last_date_master <- readRDS("data/weights/portfolio_master_sl.rds") %>% last() %>% index()
+status_last_date <- last_date_expect %>% equals(last_date_master)
+
+# entries equal
+length_entries1 <- readRDS("data/stock_table_filt_stats.rds") %>% dim() %>% .[1] 
+length_entries2 <- readRDS("data/stock_prices_filt.rds") %>% length()
+status_entries <- length_entries1 %>% equals(length_entries2)
+
+#weights dimensions
+length_entries3 <- readRDS("data/weights/stock_stat_weights.rds") %>% dim() %>% .[2]
+length_entries4 <- readRDS("data/weights/stock_fav_weights.rds") %>% dim() %>% .[2]
+status_weights_entries <- length_entries3 %>% equals(length_entries4)
+
+# strategies
+#strategies
+length_strategies1 <- readRDS("data/strategies.rds") %>% dim() %>% .[1]
+length_strategies2 <- readRDS("data/weights/rank_weights_list.rds") %>% length() 
+status_strategies <- length_strategies1 %>% equals(length_strategies2)
+
+```
+
+
+```{r}
+
+print(paste0("System date: ", Sys.Date()))
+print(paste0("Last expected portfolio update: ", last_date_expect))
+
+if (grepl("exit_error.txt", message_files) %>% any()) {
+    readLines(message_files[grepl("exit_error.txt", message_files)])
+} 
+
+status_df <- rbind(
+    c("General status", status_general),
+    c("Date status", status_last_date), 
+    c("Price file status", status_file_date),
+    c("Consistent number of entries in price files", status_entries),
+    c("Consistent number of entries in weights", status_weights_entries),
+    c("Consistent number of strategies", status_strategies)
+) %>% as.data.frame() %>%
+    `colnames<-`(c("Description", "Status")) %>%
+    dplyr::mutate(Status = Status %>% stringr::str_replace("TRUE", "OK"),
+                  Status = Status %>% stringr::str_replace("TRUE", "ERROR")) %>%
+    replace(is.na(.), "ERROR")
+
+status_df %>%
+    kableExtra::kbl("html", caption = "Portfolio Assembly Status") %>%
+    kableExtra::kable_styling(full_width = FALSE, position = "left",
+                              bootstrap_options = c("striped")) %>%
+    kableExtra::column_spec(2, bold = TRUE) %>%
+    kableExtra::row_spec(0, bold = TRUE) %>%
+    kableExtra::row_spec(which(status_df$Status == "OK"), 
+             color = "white", background = "#248100") %>%
+    kableExtra::row_spec(which(status_df$Status == "ERROR"), 
+             color = "white", background = "#D7261E")
+
+```
+
+&nbsp;
+
+### Data File Integrity
+
+&nbsp;
+
+```{r}
+
+cbind(
+    list.files("data/", pattern = "stock_"),
+    list.files("data/", pattern = "stock_", full.names = TRUE) %>%
+        lapply(function (x) {file.info(x)$mtime %>% as.character()}) %>% 
+        do.call(rbind.data.frame, .)
+) %>%
+    `colnames<-`(c("files", "date_modified"))
+
+```
+
+&nbsp;
+
+### Status Messages
+
+&nbsp;
+
+```{r}
+
+print("10_data_full")
+message_files %>% 
+    .[grepl("\\{10\\}", .)] %>%
+    readRDS()
+
+print("21_stat_weights")
+message_files %>% 
+    .[grepl("\\{21\\}", .)] %>%
+    readRDS()
+
+print("22_fav_weights")
+message_files %>% 
+    .[grepl("\\{22\\}", .)] %>%
+    readRDS()
+
+print("23_rank_weights")
+message_files %>% 
+    .[grepl("\\{23\\}", .)] %>%
+    readRDS()
+
+```
+
+&nbsp;
+
+### Cash Position
+
+&nbsp;
+
+```{r, fig.height=5, fig.width=7}
+
+portfolio_master_sl$CORR %>% 
+    plot(main = "SL-triggered changes in cash / [%]")
+
+```
+
+&nbsp;
+
+### Deprecated Instruments
+
+&nbsp;
+
+```{r}
+
+stock_table %>%
+    dplyr::filter(ISIN %in% (read.csv("./tables/deprecated.csv") %$% x)) %>%
+    dplyr::select(Name, ISIN, Symbol)
+
+```
+
+&nbsp;
+
+## Supplemental Information
+
+### Strategy Rank
+
+&nbsp;
+
+
+```{r}
+
+readRDS("data/strategies.rds") %>% 
+    dplyr::arrange_at(ncol(.)) %>%
+    dplyr::rename(ID = id, Indicator = indicator, Filter = filter,
+                  `Parameter 1` = par1, `Parameter 2` = par2,
+                  `Moving Average Periods` = n_roll, 
+                  `Moving Average` = n_roll_type, Rank = rank) %>%
+    kableExtra::kable("html") %>%
+    kableExtra::kable_styling(bootstrap_options = c("striped", "hover", 
+                                                    "condensed", "responsive")) %>%
+    kableExtra::scroll_box(width = "90%", height = "400px")
+
+```
+
+&nbsp;
+
+### Stat Weights Entries
+
+&nbsp;
+
+
+```{r}
+
+isin_filtered <- weights_files %>% 
+    .[grepl("@history", .) & grepl("stat_weights.rds", .)] %>%
+    readRDS() %>% 
+    last() %>% .[, .==1] %>%
+    names()
+
+stock_table %>% 
+    dplyr::filter(ISIN %in% isin_filtered) %>%
+    dplyr::select(Name, ISIN, annReturn, Volatility, n_crash) %>%
+    dplyr::rename(`Ann. Return` = annReturn, `N(Crash)` = n_crash) %>%
+    kableExtra::kable("html") %>%
+    kableExtra::kable_styling(bootstrap_options = c("striped", "hover", 
+                                                    "condensed", "responsive")) %>%
+    kableExtra::scroll_box(width = "90%", height = "400px")
+
+```
+
+&nbsp;
+
+### Favourite Selection Weights Entries
+
+&nbsp;
+
+```{r}
+
+isin_filtered <- weights_files %>% 
+    .[grepl("@history", .) & grepl("fav_weights.rds", .)] %>%
+    readRDS() %>% 
+    last() %>% .[, .==1] %>%
+    names()
+
+stock_table %>% 
+    dplyr::filter(ISIN %in% isin_filtered) %>%
+    dplyr::select(Name, ISIN, annReturn, Volatility, n_crash) %>%
+    dplyr::rename(`Ann. Return` = annReturn, `N(Crash)` = n_crash) %>%
+    kableExtra::kable("html") %>%
+    kableExtra::kable_styling(bootstrap_options = c("striped", "hover", 
+                                                    "condensed", "responsive")) %>%
+    kableExtra::scroll_box(width = "90%", height = "400px")
+
+```
+
+&nbsp;
+
+
+```{r, eval = FALSE}
+
+world_price %>%
+    quantmod::OHLC() %>%
+    dygraphs::dygraph(ylab = "price", group = "MSCI World") %>%
+    dygraphs::dyCandlestick() %>%
+    dygraphs::dyLegend(width = 400) %>%
+    dygraphs::dyRangeSelector(dateWindow = c("2018-01-01", as.character(Sys.Date())))
+
+```
+
+```{r, eval = FALSE}
+
+
+strategy_rps <- readRDS("data/strategy_rps.rds")
+  
+# verification only
+strategy_weights <- strategy_rps %>% 
+    sapply("[[", "rp_spread") %>% 
+    do.call(cbind.xts, .) %>%
+    PerformanceAnalytics::Return.portfolio(verbose = TRUE) %>%
+    .$"BOP.Weight" #lagged weights
+
+strategy_rps %>%
+    sapply("[[", "rp_spread") %>%
+    do.call(cbind.xts, .) %>%
+    na.fill(fill = 0) %>%
+    .[period_oi] %>%
+    calc_return_portfolio(., weights = strategy_weights) %>%
+    .$rp_stats #lagged returns
+
+strategy_rps %>% 
+    sapply("[[", "rp_spread") %>% 
+    do.call(cbind.xts, .) %>%
+    .[period_oi] %>%
+    PerformanceAnalytics::Return.portfolio() %>%
+    chart.CumReturns()
+
+
+  
+# strategy portfolio prices
+strategy_prices <- strategy_rps %>% 
+    sapply("[[", "price_spread") %>%
+    lapply(function (x) x %>% `colnames<-`("Close"))
+
+# strategy returns
+strategy_returns <- strategy_rps %>% 
+    sapply("[[", "rp_spread") %>% 
+    do.call(cbind.xts, .) %>% 
+    .[period_oi]
+strategy_returns$CORR <- -1e-09
+
+strategy_price_eqweight <- PerformanceAnalytics::Return.portfolio(strategy_returns, wealth.index = TRUE)
+
+cbind(strategy_prices %>% do.call(cbind, .), strategy_price_eqweight) %>% plot()
+  
+  # strategy portfolio prices
+strategy_prices <- strategy_rps %>% 
+    sapply("[[", "price_spread") %>%
+    lapply(function (x) x %>% `colnames<-`("Close"))
+
+
+# strategy ranks and weights
+strategy_par1 <- lapply(strategy_prices,
+                     function (x) {
+                         TTR::ROC(Cl(x), n = par1)
+                     }) %>%
+    do.call(cbind.xts, .) %>%
+    `colnames<-`(names(strategy_prices)) %>%
+    na.locf(na.rm = FALSE) %>%
+    na.fill(fill = min(as.matrix(.), na.rm = TRUE))
+
+strategy_par1 %<>% rollmean(., k = n_roll, align = "right") %>%
+    na.fill(fill = min(as.matrix(.), na.rm = TRUE))
+
+strategy_par1 %>% last() %>% t() %>% plot()
+
+```
+
+
+

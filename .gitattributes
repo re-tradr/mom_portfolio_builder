@@ -1,0 +1,4 @@
+*.Rmd linguist-language=R
+*.htm linguist-generated
+*.html linguist-generated
+*.rds linguist-generated
